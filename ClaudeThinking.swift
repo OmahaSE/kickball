@@ -2,6 +2,7 @@ import Cocoa
 import ScreenCaptureKit
 import Vision
 import ServiceManagement
+import IOKit.ps
 
 // Claude Code의 실제 상태
 enum ClaudeState { case idle, thinking, working }
@@ -53,6 +54,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stageItem = NSMenuItem(title: "바탕화면 고양이와 별", action: #selector(toggleStage), keyEquivalent: "")
         stageItem.target = self; stageItem.state = .on
         menu.addItem(stageItem)
+        let appItem = NSMenuItem(title: "쓰는 앱 창 위에서 놀기", action: #selector(toggleOnApp(_:)), keyEquivalent: "")
+        appItem.target = self; appItem.state = (UserDefaults.standard.object(forKey: "onAppWindow") as? Bool ?? true) ? .on : .off
+        menu.addItem(appItem)
         frontItem = NSMenuItem(title: "창 위에 보이기", action: #selector(toggleFront), keyEquivalent: "")
         frontItem.target = self
         menu.addItem(frontItem)
@@ -60,6 +64,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let screenItem = NSMenuItem(title: "표시할 모니터", action: nil, keyEquivalent: "")
         screenItem.submenu = screenMenu
         menu.addItem(screenItem)
+        let lookMenu = NSMenu()
+        for (i, name) in ["검은 고양이", "랙돌", "페르시안"].enumerated() {
+            let it = NSMenuItem(title: name, action: #selector(pickLook(_:)), keyEquivalent: "")
+            it.target = self; it.tag = i; it.state = Pets.look.rawValue == i ? .on : .off
+            lookMenu.addItem(it)
+        }
+        let lookItem = NSMenuItem(title: "고양이 모양", action: nil, keyEquivalent: "")
+        lookItem.submenu = lookMenu
+        menu.addItem(lookItem)
         followItem = NSMenuItem(title: "작업이 멈추면 그 앱으로 이동", action: #selector(toggleFollow), keyEquivalent: "")
         followItem.target = self; followItem.state = .on
         menu.addItem(followItem)
@@ -77,6 +90,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = menu
         render(angle: 0, spin: 0)
         stage = DesktopStage()
+        stage.onInFrontChanged = { [weak self] on in self?.frontItem?.state = on ? .on : .off }
         stage.onMove = { [weak self] in if self?.fpsSetting == 0 { self?.startClock() } }   // 다른 모니터 주사율로
         startClock()
         fpsMenu.delegate = self
@@ -87,6 +101,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sample()
     }
 
+    @objc func toggleOnApp(_ i: NSMenuItem) {
+        stage.onApp.toggle(); i.state = stage.onApp ? .on : .off
+    }
     @objc func toggleStage() {
         stage.visible.toggle(); stageItem.state = stage.visible ? .on : .off
     }
@@ -137,6 +154,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc func pickScreen(_ i: NSMenuItem) { stage.displayID = CGDirectDisplayID(i.tag) }
     @objc func pickFPS(_ i: NSMenuItem) { fpsSetting = i.tag }
+    @objc func pickLook(_ i: NSMenuItem) {
+        Pets.look = Pets.Look(rawValue: i.tag) ?? .black
+        for it in i.menu?.items ?? [] { it.state = it.tag == i.tag ? .on : .off }
+        stage.redrawCat()
+    }
     @objc func toggleNotch() { notchOn.toggle() }
     @objc func nudgeNotch(_ i: NSMenuItem) {
         switch i.tag {
@@ -261,6 +283,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let st = s == .idle ? ClaudeState.thinking : s     // 바쁜데 기록이 "답변 끝"이면 막 새로 시작한 것
             if st == .thinking { best = .thinking } else if best == .idle { best = .working }
         }
+        // Clauduo가 몰래 돌리는 claude: 기록을 남기지 않아 대화 내용은 못 읽는다 → 돌고 있으면 "생각 중"
+        let duo = Clauduo.claudePids()
+        if !duo.isEmpty { pids += duo; if best == .idle { best = .thinking } }
         return (best, cpuPercent(of: pids))
     }
 
@@ -382,6 +407,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let ph = clock.truncatingRemainder(dividingBy: Self.cycle)
         // 똑바로 선 뒤: 제자리 한 바퀴 대신 메뉴바를 굴러 왼쪽 끝까지 다녀온다
         // 별 왼쪽에 노치 영역이 있으면 거기(오른쪽 끝)에 부딪히고, 없으면 화면 왼쪽 끝까지
+        // 노치 왼쪽 자리에 있을 때는 굴러가지 않고 제자리에서 한 바퀴 돈다 (앱 메뉴 위를 지나가지 않게)
         if before < 5.8 && ph >= 5.8 && presence > 0.9, let b = item.button,
            roller.start(button: b, wall: notchArea(on: b.window?.screen).flatMap { b.window!.frame.minX >= $0.maxX ? $0.maxX : nil }) {
             clock += 5.8 - ph
@@ -768,6 +794,12 @@ final class AgentWatcher {
             }
         }
 
+        // Clauduo: 앱이 돌리는 claude가 하나라도 있으면 바쁨. 끝나면 Clauduo 앱을 앞으로.
+        if let app = Clauduo.app() {
+            let pid = app.processIdentifier
+            now["clauduo:\(pid)"] = (!Clauduo.claudePids(of: pid).isEmpty, { pid })
+        }
+
         var stopped: [pid_t] = []
         for (key, s) in now {
             if wasBusy[key] == true && !s.busy, let pid = s.pid() { stopped.append(pid) }
@@ -815,6 +847,31 @@ final class AgentWatcher {
         let out = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         return String(decoding: out, as: UTF8.self).split(separator: "\n").first.flatMap { pid_t($0) }
+    }
+}
+
+// MARK: - Clauduo 앱
+
+/// Clauduo(com.clauduo.mac)는 작업이 오면 claude를 자식 프로세스로 창 없이 실행한다(`claude -p`).
+/// 기록을 남기지 않고 계정별 설정 폴더를 쓰므로, 자식 프로세스를 직접 보고 알아낸다.
+enum Clauduo {
+    static let bundleID = "com.clauduo.mac"
+    static func app() -> NSRunningApplication? {
+        NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first
+    }
+    /// Clauduo가 돌리고 있는 claude 프로세스들 (앱이 없으면 빈 배열)
+    static func claudePids(of appPid: pid_t? = nil) -> [pid_t] {
+        guard let ap = appPid ?? app()?.processIdentifier else { return [] }
+        var buf = [pid_t](repeating: 0, count: 256)
+        let n = Int(proc_listchildpids(ap, &buf, Int32(buf.count * MemoryLayout<pid_t>.size)))
+        guard n > 0 else { return [] }
+        return buf.prefix(min(n, buf.count)).filter { pid in
+            guard pid > 0 else { return false }
+            var path = [CChar](repeating: 0, count: 4096)
+            guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return false }
+            let name = (String(cString: path) as NSString).lastPathComponent.lowercased()
+            return name.contains("claude") || name == "node"          // npm으로 깐 claude는 node로 보인다
+        }
     }
 }
 
@@ -888,10 +945,74 @@ final class Pets {
     var draggingCat = false, grabPoint = NSPoint.zero   // 고양이 목덜미를 잡고 있음 (잡은 곳, 전역)
     var dangling: Bool { hanging || draggingCat }
     var starScale: CGFloat = 1
+    /// 전체 크기: 메뉴바 위에서 놀 때는 메뉴바 높이에 맞춰 작아진다 (발 위치를 축으로)
+    var zoom: CGFloat = 1
+
     // 고양이 몸짓: 몸 기울기(도, +는 머리 위로), 웅크림 0…1, 공중, 고개 들기(도), 다리 움직임 0…1, 신남 0…1, 꼬리 시계
     var catPitch: CGFloat = 0, crouch: CGFloat = 0, catAir = false, headUp: CGFloat = 0
     var moving: CGFloat = 1, excite: CGFloat = 0, tailT: CGFloat = 0
-    func resetPose() { catPitch = 0; crouch = 0; catAir = false; headUp = 0; moving = 1; excite = 0.3 }
+    var pawUp: CGFloat = 0   // 앞발 들기 0…1 (그루밍할 때 입으로)
+    var hopY: CGFloat = 0    // 걷다가 별을 넘을 때 뜨는 높이 (그림만, 바닥 계산과는 무관)
+
+    // MARK: 꼬리 (진짜 고양이처럼 기분을 보여 줌)
+    // 각도: 0 = 뒤로 수평, 90 = 똑바로 위, 음수 = 아래로. curl = 끝으로 갈수록 앞으로 말리는 정도.
+    enum TailMood { case auto, watch, hunt, content }
+    var tailMood = TailMood.auto
+    private(set) var tailBase: CGFloat = 40, tailCurl: CGFloat = 30, tailAmp: CGFloat = 0
+    private var tailPhase: CGFloat = 0, tailFreq: CGFloat = 1, flickT: CGFloat = -1, nextFlick: CGFloat = 3
+    /// 지금 자세·기분에 맞는 꼬리 (기본 각도, 말림, 흔들림 크기(도), 빠르기, 가끔 끝만 까딱할지)
+    private func tailTarget() -> (base: CGFloat, curl: CGFloat, amp: CGFloat, freq: CGFloat, flicks: Bool) {
+        if dangling { return (-30, 10, 22, 4.5, false) }                       // 매달림: 버둥버둥
+        if catAir { return (15, -20, 0, 1, false) }                             // 점프: 뒤로 쭉 뻗어 균형
+        switch tailMood {
+        case .hunt: return (8, 15, 16, 7, false)                                // 사냥 직전: 낮게 휙휙
+        case .watch: return (-8, 70, 0, 1, true)                                // 구경: 낮게 두고 끝만 까딱
+        case .content: return (-55, 150, 0, 1, true)                            // 앉음: 발 앞으로 감아 둠
+        case .auto: break
+        }
+        if crouch > 0.4 && catPitch < 0 { return (5, 10, 4, 1.2, false) }      // 밥 먹기: 낮고 느긋하게
+        if moving > 0.5 && excite > 0.7 { return (12, 25, 9, 5, false) }       // 달려서 쫓기: 뒤로 뻗고 출렁
+        if moving > 0.5 { return (78, 60, 6, 2, false) }                        // 기분 좋게 걷기: 꼿꼿이 세우고 끝은 물음표
+        return (45, 45, 0, 1, true)                                             // 서 있음: 반쯤 들고 가끔 까딱
+    }
+    /// 꼬리를 목표 쪽으로 부드럽게 옮긴다. 눈에 띄게 바뀌면 true (다시 그려야 함)
+    func updateTail(_ dt: Double) -> Bool {
+        guard catMode == .run else { flickT = -1; return false }
+        let g = tailTarget(), k = min(1, 4 * CGFloat(dt))
+        let old = (tailBase, tailCurl, tailAmp)
+        tailBase += (g.base - tailBase) * k; tailCurl += (g.curl - tailCurl) * k; tailAmp += (g.amp - tailAmp) * k
+        tailFreq = g.freq
+        if tailAmp > 0.3 { tailPhase += CGFloat(dt) * tailFreq * 2 * .pi }
+        // 가끔 꼬리 끝만 까딱 (0.6초), 그 사이에는 가만히 → 다시 그리지 않음
+        var flicking = false
+        if g.flicks {
+            if flickT >= 0 { flickT += CGFloat(dt); flicking = true; if flickT > 0.6 { flickT = -1; nextFlick = .random(in: 2.5...7) } }
+            else { nextFlick -= CGFloat(dt); if nextFlick <= 0 { flickT = 0; flicking = true } }
+        } else { flickT = -1 }
+        let moved = abs(old.0 - tailBase) + abs(old.1 - tailCurl) + abs(old.2 - tailAmp)
+        return moved > 0.15 || tailAmp > 0.3 || flicking
+    }
+    /// 꼬리 경로: 뿌리(x, y)에서 6마디로
+    func tailPath(from root: NSPoint, length: CGFloat) -> NSBezierPath {
+        let n = 7, seg = length / CGFloat(n)
+        let flick = flickT >= 0 ? sin(.pi * min(flickT / 0.3, 2)) * 28 : 0
+        var p = root, pts = [root]
+        for i in 1...n {
+            let f = CGFloat(i) / CGFloat(n)
+            let a = (tailBase + tailCurl * f * f + tailAmp * sin(tailPhase - CGFloat(i) * 0.6) * f + flick * f * f * f) * .pi / 180
+            p = NSPoint(x: p.x - cos(a) * seg, y: p.y + sin(a) * seg)
+            pts.append(p)
+        }
+        let path = NSBezierPath(); path.lineCapStyle = .round; path.lineJoinStyle = .round
+        path.move(to: pts[0])
+        for i in 1..<pts.count - 1 {   // 마디 사이를 부드럽게
+            let mid = NSPoint(x: (pts[i].x + pts[i + 1].x) / 2, y: (pts[i].y + pts[i + 1].y) / 2)
+            path.curve(to: mid, controlPoint1: pts[i], controlPoint2: pts[i])
+        }
+        path.line(to: pts.last!)
+        return path
+    }
+    func resetPose() { catPitch = 0; crouch = 0; catAir = false; headUp = 0; moving = 1; excite = 0.3; pawUp = 0; hopY = 0 }
 
     var starCenter: NSPoint { NSPoint(x: starX, y: starFloor + starY + 11) }
     /// 같은 바닥: 화면 인식은 같은 글자 줄도 몇 px씩 다르게 잡으므로 14px 안이면 같은 줄로 본다
@@ -901,7 +1022,7 @@ final class Pets {
     func catRect() -> NSRect {
         let anchor = hanging ? starCenter : draggingCat ? grabPoint : nil
         return anchor.map { NSRect(x: $0.x - 60, y: $0.y - 75, width: 120, height: 100) }
-            ?? NSRect(x: catX - 50, y: catFloor + catY - 12, width: 100, height: 80)
+            ?? NSRect(x: catX - 50, y: catFloor + catY + hopY - 12, width: 100, height: 80)
     }
     func starRect() -> NSRect { NSRect(x: starX - 30, y: starFloor + starY - 19, width: 60, height: 60) }
 
@@ -917,41 +1038,109 @@ final class Pets {
 
     // 닿았는지(전역 좌표): 그림 크기 + 여유 4px
     func onCat(_ p: NSPoint) -> Bool {
-        abs(p.x - catX) < 31 && p.y > catFloor + catY - 4 && p.y < catFloor + catY + 35
+        abs(p.x - catX) < 31 * zoom && p.y > catFloor + catY - 4 && p.y < catFloor + catY + 35 * zoom
     }
-    func onStar(_ p: NSPoint) -> Bool { hypot(p.x - starX, p.y - starCenter.y) < 15 }
+    func onStar(_ p: NSPoint) -> Bool { hypot(p.x - starX, p.y - (starFloor + starY + 11 * zoom)) < 15 * zoom + 2 }
 
     private let outline = NSColor(white: 1, alpha: 0.9)
     private let fur = NSColor(white: 0.16, alpha: 1)
+
+    /// 밥그릇: 바닥(floor)에 놓인 그릇과 사료 (food 0…1)
+    static func drawBowl(x: CGFloat, floor: CGFloat, food: CGFloat, zoom: CGFloat = 1) {
+        NSGraphicsContext.saveGraphicsState(); defer { NSGraphicsContext.restoreGraphicsState() }
+        let z = NSAffineTransform(); z.translateX(by: x, yBy: floor); z.scale(by: zoom); z.translateX(by: -x, yBy: -floor); z.concat()
+        let outline = NSColor(white: 1, alpha: 0.9)
+        if food > 0.03 {
+            // 사료 더미: 양만큼 봉긋하게
+            let h = 3 + 7 * food
+            let pile = NSBezierPath(ovalIn: NSRect(x: x - 16, y: floor + 11 - h * 0.35, width: 32, height: h))
+            outline.setStroke(); pile.lineWidth = 2; pile.stroke()
+            NSColor(calibratedRed: 0.62, green: 0.38, blue: 0.2, alpha: 1).setFill(); pile.fill()
+            NSColor(calibratedRed: 0.42, green: 0.24, blue: 0.12, alpha: 1).setFill()
+            for (dx, dy) in [(-9.0, 0.3), (-3.0, 0.6), (4.0, 0.4), (10.0, 0.2), (0.0, 0.9)] where food > dy * 0.8 {
+                NSBezierPath(ovalIn: NSRect(x: x + CGFloat(dx) - 1.6, y: floor + 11 + CGFloat(dy) * h * 0.5 - 1.6, width: 3.2, height: 3.2)).fill()
+            }
+        }
+        // 그릇: 아래가 좁은 사다리꼴
+        let dish = NSBezierPath()
+        dish.move(to: NSPoint(x: x - 13, y: floor + 1)); dish.line(to: NSPoint(x: x + 13, y: floor + 1))
+        dish.line(to: NSPoint(x: x + 20, y: floor + 12)); dish.line(to: NSPoint(x: x - 20, y: floor + 12)); dish.close()
+        dish.lineJoinStyle = .round
+        outline.setStroke(); dish.lineWidth = 2.4; dish.stroke()
+        NSColor(calibratedRed: 0.85, green: 0.47, blue: 0.34, alpha: 1).setFill(); dish.fill()
+        let rim = NSBezierPath(); rim.move(to: NSPoint(x: x - 18, y: floor + 9)); rim.line(to: NSPoint(x: x + 18, y: floor + 9))
+        NSColor(white: 1, alpha: 0.35).setStroke(); rim.lineWidth = 1.5; rim.stroke()
+    }
+
+    /// 고양이 모양: 검은 고양이 · 랙돌(크림색 몸 + 갈색 얼굴·귀·다리·꼬리, 파란 눈) · 페르시안(하얀 장모, 납작한 얼굴, 구릿빛 눈)
+    enum Look: Int { case black, ragdoll, persian }
+    static var look = Look(rawValue: UserDefaults.standard.integer(forKey: "catLook")) ?? .black {
+        didSet { UserDefaults.standard.set(look.rawValue, forKey: "catLook") }
+    }
+    private struct Palette { let body, point, muzzle, eye, line: NSColor; let lineW, fluff: CGFloat; let nose: Bool }
+    private static func rgb(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> NSColor { NSColor(calibratedRed: r, green: g, blue: b, alpha: 1) }
+    private var palette: Palette {
+        switch Self.look {
+        case .black:
+            return Palette(body: fur, point: fur, muzzle: fur, eye: Self.rgb(1, 0.85, 0.3), line: outline, lineW: 2.4, fluff: 0, nose: false)
+        case .ragdoll:
+            return Palette(body: Self.rgb(0.96, 0.92, 0.84), point: Self.rgb(0.42, 0.31, 0.24), muzzle: Self.rgb(0.98, 0.96, 0.92),
+                           eye: Self.rgb(0.3, 0.58, 0.98), line: NSColor(white: 0.22, alpha: 0.85), lineW: 2.0, fluff: 1.6, nose: true)
+        case .persian:
+            return Palette(body: Self.rgb(0.98, 0.97, 0.95), point: Self.rgb(0.93, 0.91, 0.88), muzzle: Self.rgb(0.98, 0.97, 0.95),
+                           eye: Self.rgb(0.86, 0.5, 0.14), line: NSColor(white: 0.25, alpha: 0.85), lineW: 2.0, fluff: 2.2, nose: true)
+        }
+    }
+    /// 복슬복슬한 타원: 테두리를 따라 작은 털 뭉치가 볼록볼록 (fluff 0이면 그냥 타원)
+    static func fluffy(_ r: NSRect, bumps: Int, fluff: CGFloat) -> NSBezierPath {
+        guard fluff > 0 else { return NSBezierPath(ovalIn: r) }
+        let c = NSPoint(x: r.midX, y: r.midY), a = r.width / 2, b = r.height / 2
+        func at(_ t: CGFloat, _ k: CGFloat) -> NSPoint { NSPoint(x: c.x + cos(t) * (a + k), y: c.y + sin(t) * (b + k)) }
+        let p = NSBezierPath(), n = CGFloat(bumps)
+        p.move(to: at(0, 0))
+        for i in 0..<bumps {
+            let t0 = CGFloat(i) * 2 * .pi / n, t1 = CGFloat(i + 1) * 2 * .pi / n
+            p.curve(to: at(t1, 0), controlPoint1: at(t0 + (t1 - t0) * 0.2, fluff), controlPoint2: at(t0 + (t1 - t0) * 0.8, fluff))
+        }
+        p.close()
+        return p
+    }
 
     func drawCat() {
         NSGraphicsContext.saveGraphicsState()
         let t = NSAffineTransform()
         if hanging {
             // 입(22, 17)을 별 가운데에 붙이고 몸은 아래로 늘어뜨림
-            t.translateX(by: starCenter.x, yBy: starCenter.y)
+            t.translateX(by: starCenter.x, yBy: starCenter.y); t.scale(by: zoom)
             t.rotate(byDegrees: 90 * catFacing + catSway)
             t.scaleX(by: catFacing, yBy: 1)
             t.translateX(by: -22, yBy: -17)
         } else if draggingCat {
             // 목덜미(12, 25)를 잡힌 채 몸이 아래로 늘어짐
-            t.translateX(by: grabPoint.x, yBy: grabPoint.y)
+            t.translateX(by: grabPoint.x, yBy: grabPoint.y); t.scale(by: zoom)
             t.rotate(byDegrees: 90 * catFacing + catSway)
             t.scaleX(by: catFacing, yBy: 1)
             t.translateX(by: -12, yBy: -25)
         } else {
-            t.translateX(by: catX, yBy: catFloor + catY)
+            t.translateX(by: catX, yBy: catFloor + catY + hopY); t.scale(by: zoom)
             t.scaleX(by: catFacing, yBy: 1)
             t.translateX(by: 0, yBy: 12); t.rotate(byDegrees: catPitch); t.translateX(by: 0, yBy: -12)   // 몸 기울기
         }
         t.concat()
-        let body = NSBezierPath(), extra = NSBezierPath()
+        let pal = palette, fl = pal.fluff, lw = pal.lineW
+        let tailW: CGFloat = fl > 0 ? 6.5 : 3.2, legW: CGFloat = fl > 0 ? 3.8 : 3.2
+        /// 테두리를 먼저 모두 그리고 나서 색을 채운다 (겹친 안쪽 테두리는 색에 덮임)
+        func outlineThen(_ strokes: [(NSBezierPath, CGFloat)], _ fills: [NSBezierPath]) {
+            pal.line.setStroke()
+            for (p, w) in strokes { p.lineWidth = w + lw; p.stroke() }
+            for p in fills { p.lineWidth = lw; p.stroke() }
+        }
         switch catMode {
         case .run:
             let s = sin(catPhase)
             let bob = (catAir || dangling ? 0 : abs(s) * 2.5) - crouch * 5   // 웅크리면 몸이 낮아짐
             // 다리 4개
-            let legs = NSBezierPath(); legs.lineWidth = 3.2; legs.lineCapStyle = .round
+            let legs = NSBezierPath(); legs.lineCapStyle = .round
             for (hipX, off) in [(-10.0, 0.0), (-6.0, CGFloat.pi), (8.0, CGFloat.pi * 0.5), (12.0, CGFloat.pi * 1.5)] {
                 let front = hipX > 0
                 legs.move(to: NSPoint(x: hipX, y: 10 + bob))
@@ -962,6 +1151,9 @@ final class Pets {
                 } else if catAir {
                     // 점프: 앞발은 앞으로 뻗고, 뒷발은 뒤로 쭉
                     legs.line(to: front ? NSPoint(x: hipX + 9, y: 15 + bob) : NSPoint(x: hipX - 9, y: 4 + bob))
+                } else if pawUp > 0 && hipX == 12 {
+                    // 앞발 하나를 입 쪽으로 들어 올림 (그루밍)
+                    legs.line(to: NSPoint(x: hipX + 6 * pawUp, y: 1 + (12 + bob) * pawUp))
                 } else {
                     // 달리기(멈춰 있으면 다리를 모으고 섬), 웅크리면 무릎을 굽힘
                     let sw = sin(catPhase + off) * 5 * moving
@@ -969,45 +1161,67 @@ final class Pets {
                                           y: max(0, 1 + cos(catPhase + off) * 2 * moving)))
                 }
             }
-            body.append(NSBezierPath(ovalIn: NSRect(x: -16, y: 8 + bob, width: 32, height: 14)))
+            // 꼬리: 기분에 따라 (걷기 = 꼿꼿이 물음표, 쫓기 = 뒤로 뻗어 출렁, 앉기 = 발 앞으로 감기, 구경 = 끝만 까딱)
+            let tail = tailPath(from: NSPoint(x: -14, y: 16 + bob), length: fl > 0 ? 20 : 19)
+            let body = Self.fluffy(NSRect(x: -16, y: 8 + bob - fl * 0.5, width: 32, height: 14 + fl), bumps: 15, fluff: fl)
+            let ruff = fl > 0 ? Self.fluffy(NSRect(x: 6, y: 9 + bob, width: 12, height: 12), bumps: 7, fluff: fl * 0.8) : nil   // 가슴 털
             // 머리: 목(13, 19)을 축으로 별 쪽을 올려다봄
-            let head = NSBezierPath(ovalIn: NSRect(x: 10, y: 14 + bob, width: 14, height: 13))
-            head.move(to: NSPoint(x: 12, y: 24 + bob)); head.line(to: NSPoint(x: 13.5, y: 31 + bob)); head.line(to: NSPoint(x: 17, y: 26 + bob)); head.close()
-            head.move(to: NSPoint(x: 18, y: 26 + bob)); head.line(to: NSPoint(x: 21.5, y: 31 + bob)); head.line(to: NSPoint(x: 23, y: 23 + bob)); head.close()
-            let eye = NSBezierPath(ovalIn: NSRect(x: 18.5, y: 20.5 + bob, width: 2.6, height: 2.6))
+            let headR = fl > 0 ? NSRect(x: 9, y: 13.5 + bob, width: 16, height: 14.5) : NSRect(x: 10, y: 14 + bob, width: 14, height: 13)
+            let head = Self.fluffy(headR, bumps: 12, fluff: fl * 0.6)
+            let ears = NSBezierPath()
+            if Self.look == .persian {   // 페르시안: 털에 묻힌 작고 동그스름한 귀
+                ears.move(to: NSPoint(x: 11.5, y: 25 + bob)); ears.line(to: NSPoint(x: 13, y: 30 + bob)); ears.line(to: NSPoint(x: 16.5, y: 27 + bob)); ears.close()
+                ears.move(to: NSPoint(x: 18.5, y: 27.5 + bob)); ears.line(to: NSPoint(x: 21.5, y: 30 + bob)); ears.line(to: NSPoint(x: 23.5, y: 24.5 + bob)); ears.close()
+            } else {
+                ears.move(to: NSPoint(x: 12, y: 24 + bob)); ears.line(to: NSPoint(x: 13.5, y: 31 + bob)); ears.line(to: NSPoint(x: 17, y: 26 + bob)); ears.close()
+                ears.move(to: NSPoint(x: 18, y: 26 + bob)); ears.line(to: NSPoint(x: 21.5, y: 31 + bob)); ears.line(to: NSPoint(x: 23, y: 23 + bob)); ears.close()
+            }
+            let muzzle = NSBezierPath(ovalIn: NSRect(x: 16.5, y: 14 + bob, width: 8.5, height: 6.5))   // 랙돌: 밝은 입가
+            let eye = NSBezierPath(ovalIn: fl > 0 ? NSRect(x: 17.8, y: 19.6 + bob, width: 3.8, height: 3.8)
+                                                 : NSRect(x: 18.5, y: 20.5 + bob, width: 2.6, height: 2.6))
+            let nose = NSBezierPath(ovalIn: NSRect(x: 23, y: 18 + bob, width: 2, height: 1.6))
             let look = NSAffineTransform()
             look.translateX(by: 13, yBy: 19 + bob); look.rotate(byDegrees: headUp); look.translateX(by: -13, yBy: -19 - bob)
-            head.transform(using: look as AffineTransform); eye.transform(using: look as AffineTransform)
-            body.append(head)
-            // 꼬리: 늘 살랑살랑, 신나면(쫓을 때) 크게
-            let wag = sin(tailT * (3 + 5 * excite)) * (4 + 6 * excite)
-            extra.lineWidth = 3.2; extra.lineCapStyle = .round
-            extra.move(to: NSPoint(x: -15, y: 17 + bob))
-            extra.curve(to: NSPoint(x: -26, y: 24 + wag + bob),
-                        controlPoint1: NSPoint(x: -21, y: 17 + bob), controlPoint2: NSPoint(x: -25, y: 19 + wag * 0.6 + bob))
-            for p in [legs, extra] { outline.setStroke(); p.lineWidth += 2.4; p.stroke(); p.lineWidth -= 2.4 }
-            outline.setStroke(); body.lineWidth = 2.4; body.stroke()
-            fur.setFill(); body.fill()
-            fur.setStroke(); legs.stroke(); extra.stroke()
-            NSColor(calibratedRed: 1, green: 0.85, blue: 0.3, alpha: 1).setFill()
-            eye.fill()
+            for p in [head, ears, muzzle, eye, nose] { p.transform(using: look as AffineTransform) }
+
+            outlineThen([(legs, legW), (tail, tailW)], [body] + (ruff.map { [$0] } ?? []) + [ears, head])
+            pal.point.setStroke()
+            legs.lineWidth = legW; legs.stroke()
+            tail.lineWidth = tailW; tail.stroke()
+            pal.body.setFill(); body.fill(); ruff?.fill()
+            pal.point.setFill(); ears.fill(); head.fill()
+            if Self.look == .ragdoll { pal.muzzle.setFill(); muzzle.fill() }
+            if fl > 0 {
+                // 순한 눈: 동그랗고 큰 까만 눈동자 + 가장자리에 살짝 보이는 눈 색 + 반짝이는 하얀 점
+                let e = eye.bounds
+                pal.eye.setFill(); eye.fill()
+                NSColor(white: 0.08, alpha: 1).setFill(); NSBezierPath(ovalIn: e.insetBy(dx: 0.45, dy: 0.45)).fill()
+                NSColor.white.setFill(); NSBezierPath(ovalIn: NSRect(x: e.midX + 0.1, y: e.midY + 0.2, width: 1.2, height: 1.2)).fill()
+            } else {
+                pal.eye.setFill(); eye.fill()
+            }
+            if pal.nose { Self.rgb(0.93, 0.55, 0.6).setFill(); nose.fill() }
         case .sleep:
             // 웅크린 모습: 동그란 몸, 몸에 기댄 머리, 몸을 감싼 꼬리
-            body.append(NSBezierPath(ovalIn: NSRect(x: -16, y: 0, width: 30, height: 15)))
-            body.append(NSBezierPath(ovalIn: NSRect(x: 5, y: 2, width: 13, height: 11)))
-            body.move(to: NSPoint(x: 7, y: 11)); body.line(to: NSPoint(x: 8.5, y: 17)); body.line(to: NSPoint(x: 11.5, y: 12.5)); body.close()
-            body.move(to: NSPoint(x: 12.5, y: 12.5)); body.line(to: NSPoint(x: 16, y: 16.5)); body.line(to: NSPoint(x: 17.5, y: 9.5)); body.close()
-            extra.lineWidth = 3.2; extra.lineCapStyle = .round
-            extra.move(to: NSPoint(x: -15, y: 5))
-            extra.curve(to: NSPoint(x: 4, y: 1.5), controlPoint1: NSPoint(x: -18, y: -1), controlPoint2: NSPoint(x: -4, y: -1))
-            outline.setStroke(); body.lineWidth = 2.4; body.stroke()
-            extra.lineWidth = 5.6; extra.stroke(); extra.lineWidth = 3.2
-            fur.setFill(); body.fill()
-            fur.setStroke(); extra.stroke()
+            let body = Self.fluffy(NSRect(x: -16, y: 0, width: 30, height: 15 + fl * 0.6), bumps: 15, fluff: fl)
+            let head = Self.fluffy(fl > 0 ? NSRect(x: 4, y: 1.5, width: 15, height: 12.5) : NSRect(x: 5, y: 2, width: 13, height: 11), bumps: 8, fluff: fl * 0.6)
+            let ears = NSBezierPath()
+            ears.move(to: NSPoint(x: 7, y: 11)); ears.line(to: NSPoint(x: 8.5, y: Self.look == .persian ? 16 : 17)); ears.line(to: NSPoint(x: 11.5, y: 12.5)); ears.close()
+            ears.move(to: NSPoint(x: 12.5, y: 12.5)); ears.line(to: NSPoint(x: 16, y: Self.look == .persian ? 15.5 : 16.5)); ears.line(to: NSPoint(x: 17.5, y: 9.5)); ears.close()
+            let tail = NSBezierPath(); tail.lineCapStyle = .round
+            tail.move(to: NSPoint(x: -15, y: 5))
+            tail.curve(to: NSPoint(x: 4, y: 1.5), controlPoint1: NSPoint(x: -18, y: -1), controlPoint2: NSPoint(x: -4, y: -1))
+            let muzzle = NSBezierPath(ovalIn: NSRect(x: 11, y: 2, width: 7.5, height: 5.5))
+            outlineThen([], [body, ears, head])
+            pal.body.setFill(); body.fill()
+            pal.point.setFill(); ears.fill(); head.fill()
+            if Self.look == .ragdoll { pal.muzzle.setFill(); muzzle.fill() }
+            pal.line.setStroke(); tail.lineWidth = tailW + lw; tail.stroke()
+            pal.point.setStroke(); tail.lineWidth = tailW; tail.stroke()
             // 감은 눈
             let eye = NSBezierPath(); eye.lineWidth = 1; eye.lineCapStyle = .round
             eye.move(to: NSPoint(x: 12.5, y: 7)); eye.curve(to: NSPoint(x: 15.5, y: 7), controlPoint1: NSPoint(x: 13.5, y: 6), controlPoint2: NSPoint(x: 14.5, y: 6))
-            NSColor(white: 0.75, alpha: 1).setStroke(); eye.stroke()
+            (Self.look == .black ? NSColor(white: 0.75, alpha: 1) : NSColor(white: 0.15, alpha: 1)).setStroke(); eye.lineWidth = fl > 0 ? 1.2 : 1; eye.stroke()
         }
         NSGraphicsContext.restoreGraphicsState()
     }
@@ -1016,9 +1230,10 @@ final class Pets {
         NSGraphicsContext.saveGraphicsState()
         let t = NSAffineTransform()
         // 기울면 가장 낮은 끝이 바닥에 닿도록 가운데 높이를 맞춘다
-        t.translateX(by: starX, yBy: starFloor + starY + Self.support(starAngle) * starScale)
+        let k = starScale * zoom
+        t.translateX(by: starX, yBy: starFloor + starY + Self.support(starAngle) * k)
         t.rotate(byDegrees: -starAngle)
-        t.scale(by: starScale)          // 입에 문 별은 조금 작게 (천천히 바뀜)
+        t.scale(by: k)          // 입에 문 별은 조금 작게 (천천히 바뀜)
         t.concat()
         let path = NSBezierPath(); path.lineCapStyle = .round
         for i in 0..<8 {
@@ -1052,11 +1267,12 @@ final class SpriteView: NSView {
 
 final class DesktopStage {
     let pets = Pets()
-    let catWin: NSWindow, starWin: NSWindow
-    let catView = SpriteView(), starView = SpriteView()
-    static let catSize = NSSize(width: 140, height: 120), starSize = NSSize(width: 70, height: 70)
+    let catWin: NSWindow, starWin: NSWindow, bowlWin: NSWindow
+    let catView = SpriteView(), starView = SpriteView(), bowlView = SpriteView()
+    static let catSize = NSSize(width: 140, height: 120), starSize = NSSize(width: 70, height: 70), bowlSize = NSSize(width: 60, height: 36)
     var visible = true { didSet { orderWindows() } }
-    var inFront = false { didSet { applyLevel() } }
+    var inFront = false { didSet { applyLevel(); if inFront != oldValue { onInFrontChanged?(inFront) } } }
+    var onInFrontChanged: ((Bool) -> Void)?             // 메뉴의 "창 위에 보이기" 체크 표시를 맞춘다
 
     private var jump: (from: CGFloat, to: CGFloat, t: Double)?
     private var lastBusy = false, catGrabbable = false, starGrabbable = false
@@ -1067,7 +1283,159 @@ final class DesktopStage {
 
     /// 각 모니터의 쓸 수 있는 영역(Dock·메뉴바 제외). minY가 그 모니터의 바닥. 확인용 그림에서는 가짜 배열을 쓴다.
     var simScreens: [NSRect]?
-    var screens: [NSRect] { simScreens ?? NSScreen.screens.map(\.visibleFrame) }
+    var screens: [NSRect] { simScreens ?? (appTop.map { [$0] } ?? NSScreen.screens.map(\.visibleFrame)) }
+
+    // MARK: 쓰는 앱 창 위: 켜 두면 지금 쓰는 앱 창의 윗변이 바닥이 된다 (창이 움직이면 같이, 다른 앱으로 바꾸면 그 창 위로)
+    var onApp = UserDefaults.standard.object(forKey: "onAppWindow") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(onApp, forKey: "onAppWindow"); appCheckAt = 0; if !onApp { setAppTop(nil) } }
+    }
+    private(set) var appTop: NSRect?          // 창 윗변 = minY. 위쪽은 화면 끝까지 (고양이가 설 공간)
+    private var appCheckAt = 0.0
+
+    /// 지금 바닥으로 쓰는 앱 창의 번호. 같은 창이면 매 프레임 그 창 하나만 물어봐서(싸다) 끌기·크기 바꾸기를 끊김 없이 따라간다.
+    private var appWinID: CGWindowID?
+
+    /// 맨 앞 앱의 맨 위 창 윗변 (전역 좌표). 창이 없거나 이 앱이 맨 앞이면 nil / 그대로.
+    /// - 매 프레임: 기억한 창 하나의 위치만 읽어 바닥을 바로 옮긴다 (창 서버가 가진 실제 위치라 화면 녹화보다 빠르고 가볍다)
+    /// - 0.2초마다: 전체 창 목록을 훑어 맨 앞 창이 바뀌었는지 본다
+    private func trackAppWindow() {
+        guard onApp, !simulate, trip == nil else { return }
+        let now = CACurrentMediaTime()
+        if now - appCheckAt <= 0.2 {
+            guard let id = appWinID, let f = Self.frameOf(id) else { return }
+            if let (r, bar) = floorRect(f) { setAppTop(r, menuBar: bar, sameWindow: true) }
+            return
+        }
+        appCheckAt = now
+        guard let front = NSWorkspace.shared.frontmostApplication else { return }
+        if front.processIdentifier == getpid() { return }          // 고양이를 잡는 중 등: 그대로 둔다
+        var found: (NSRect, Bool)?, id: CGWindowID?
+        for w in CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [] {
+            guard (w[kCGWindowLayer as String] as? Int) == 0, (w[kCGWindowOwnerPID as String] as? Int32) == front.processIdentifier,
+                  let b = w[kCGWindowBounds as String] as? [String: CGFloat],
+                  let r = floorRect(CGRect(x: b["X"] ?? 0, y: b["Y"] ?? 0, width: b["Width"] ?? 0, height: b["Height"] ?? 0)) else { continue }
+            found = r; id = CGWindowID(w[kCGWindowNumber as String] as? Int ?? 0)
+            break                                                   // 목록은 앞→뒤 순서: 처음 것이 맨 위 창
+        }
+        let same = id != nil && id == appWinID
+        appWinID = id
+        setAppTop(found?.0, menuBar: found?.1 ?? false, sameWindow: same)
+    }
+
+    /// 창 테두리(창 서버 좌표, 위가 0) → 고양이가 설 바닥과 메뉴바 여부. 너무 작거나 화면 밖이면 nil
+    private func floorRect(_ f: CGRect) -> (NSRect, Bool)? {
+        guard f.width >= 200, f.height >= 100 else { return nil }
+        let H = NSScreen.screens.first?.frame.height ?? 0
+        let top = H - f.minY
+        guard let scr = NSScreen.screens.first(where: { $0.frame.contains(NSPoint(x: f.midX, y: top - 1)) }) else { return nil }
+        let l = max(f.minX, scr.frame.minX), r = min(f.maxX, scr.frame.maxX)
+        guard r - l >= 160 else { return nil }
+        // 메뉴바는 인식하지 않는다: 창 윗변이 메뉴바에 가까워져도 미리 뛰어오르지 않고 창 윗변에 그대로 서서 따라 올라간다.
+        // 몸이 메뉴바에 걸치기 시작하면(true) 메뉴바에 가려지지 않게 그 위에 그리고, 남은 높이에 맞춰 조금씩 작아진다.
+        let bar = Self.menuBar(of: scr), y = min(top, bar.minY)
+        return (NSRect(x: l, y: y, width: r - l, height: max(scr.frame.maxY - y, 2)), bar.minY - y < 44)
+    }
+
+    /// 창 윗변이 메뉴바 가까이 있어 고양이 몸이 메뉴바에 걸칠 때 true. 이때 고양이·별·밥그릇을 메뉴바보다 위에 그린다.
+    private(set) var onMenuBar = false
+    /// 그 화면의 메뉴바 띠 (전역 좌표). minY = 메뉴바 아래 가장자리
+    static func menuBar(of scr: NSScreen) -> NSRect {
+        let h = max(scr.frame.maxY - scr.visibleFrame.maxY, scr.safeAreaInsets.top, NSStatusBar.system.thickness)
+        return NSRect(x: scr.frame.minX, y: scr.frame.maxY - h, width: scr.frame.width, height: h)
+    }
+    /// 메뉴바 높이에 들어가는 크기 (고양이 키 약 40pt). 노치 있는 화면이면 살짝만 줄어든다.
+    var menuZoom: CGFloat {
+        guard onMenuBar, let h = appTop?.height else { return 1 }
+        return min(1, max(0.5, (h - 3) / 40))
+    }
+
+    /// 바닥을 바꾸고, 예전 바닥에 서 있던 고양이·별을 새 바닥의 같은 비율 자리로 옮긴다
+    private func setAppTop(_ new: NSRect?, menuBar: Bool = false, sameWindow sameID: Bool = false) {
+        if let a = appTop, let b = new, abs(a.minX - b.minX) < 0.5, abs(a.minY - b.minY) < 0.5, abs(a.width - b.width) < 0.5 { return }
+        if appTop == nil && new == nil { return }
+        let old = screens, p = pets
+        // 같은 창이 움직인 것(끌기·크기 바꾸기)이면 바로 따라가고, 다른 창으로 바뀌면 폴짝 뛰어 건너간다
+        let sameWindow = sameID || (appTop.flatMap { a in new.map { b in abs(a.minY - b.minY) < 60 && abs(a.midX - b.midX) < 200 } } ?? false)
+        // 뛰는 중에 같은 창이 움직이면 착지할 바닥도 같이 옮긴다
+        if sameWindow, var l = leap, let a = appTop, let b = new {
+            let dy = b.minY - a.minY
+            l.cat?.floor += dy; l.star?.floor += dy; leap = l
+        }
+        appTop = new; onMenuBar = menuBar
+        let now = screens
+        /// 새 바닥에서의 자리. nil이면 옮기지 않음
+        func target(_ x: CGFloat, _ floor: CGFloat, _ y: CGFloat) -> (x: CGFloat, floor: CGFloat)? {
+            let from = old.first { abs($0.minY - floor) < 0.5 && x >= $0.minX - 1 && x <= $0.maxX + 1 }
+            if from == nil && ground(x: x, y: floor + max(y, 0)) != nil { return nil }   // 발판 위 등: 아래에 바닥이 있으면 그대로
+            let f = from.map { ($0.width > 0 ? (x - $0.minX) / $0.width : 0.5) } ?? 0.5
+            let to = now.first { x >= $0.minX && x <= $0.maxX } ?? now.first ?? .zero
+            return (to.minX + to.width * min(max(f, 0.08), 0.92), to.minY)
+        }
+        let catTo = p.draggingCat ? nil : target(p.catX, p.catFloor, p.catY)
+        let starTo = p.dragging || p.held ? nil : target(p.starX, p.starFloor, p.starY)
+        let far = catTo.map { hypot($0.x - p.catX, $0.floor - (p.catFloor + p.catY)) > 24 } ?? false
+        if !sameWindow && far && !simulate {
+            // 폴짝: 지금 자리(전역 높이)에서 새 창 윗변까지 포물선
+            leap = Leap(cat: catTo.map { (p.catX, p.catFloor + p.catY, $0.x, $0.floor) },
+                        star: starTo.map { (p.starX, p.starFloor + p.starY, $0.x, $0.floor) })
+        } else {
+            if let c = catTo { p.catX = c.x; p.catFloor = c.floor; if p.catY < 0 { p.catY = 0 } }
+            if let s = starTo { p.starX = s.x; p.starFloor = s.floor; if p.starY < 0 { p.starY = 0 } }
+        }
+        if p.held { p.starX = p.catX + 38; p.starFloor = p.catFloor }
+        jump = nil; hopTarget = nil
+        applyLevel(); dirty = true
+    }
+
+    /// 창을 건너뛰는 점프. 웅크림 → 포물선 비행 → 착지 웅크림
+    struct Leap {
+        var cat: (x0: CGFloat, y0: CGFloat, x1: CGFloat, floor: CGFloat)?
+        var star: (x0: CGFloat, y0: CGFloat, x1: CGFloat, floor: CGFloat)?
+        var t = 0.0
+        static let crouch = 0.14, land = 0.16
+        var fly: Double {
+            let d = cat.map { hypot($0.x1 - $0.x0, $0.floor - $0.y0) } ?? star.map { hypot($0.x1 - $0.x0, $0.floor - $0.y0) } ?? 0
+            return 0.45 + min(Double(d) / 1800, 0.45)
+        }
+    }
+    private var leap: Leap?
+
+    private func stepLeap(_ dt: Double) {
+        guard var l = leap else { return }
+        let v = pets
+        l.t += dt
+        let fly = l.fly, u = CGFloat(min(max((l.t - Leap.crouch) / fly, 0), 1))
+        func arc(_ a: (x0: CGFloat, y0: CGFloat, x1: CGFloat, floor: CGFloat), _ u: CGFloat) -> (x: CGFloat, y: CGFloat) {
+            // 출발·도착을 잇는 직선 위로 솟았다 내려오는 포물선 (위로 뛸수록, 멀수록 더 높이)
+            let lin = a.y0 + (a.floor - a.y0) * u
+            let h = 60 + 0.12 * abs(a.x1 - a.x0) + 0.6 * max(0, a.floor - a.y0)
+            let e = u * u * (3 - 2 * u)                                   // 옆으로는 부드럽게 출발·도착
+            return (a.x0 + (a.x1 - a.x0) * e, lin + h * 4 * u * (1 - u))
+        }
+        if let c = l.cat {
+            v.catMode = .run; v.moving = 0; v.catFacing = c.x1 >= c.x0 ? 1 : -1
+            if l.t < Leap.crouch {                                        // 웅크림
+                v.catAir = false; v.crouch = 0.5; v.catPitch = -6
+            } else if u < 1 {                                             // 비행
+                let p = arc(c, u)
+                v.catX = p.x; v.catFloor = c.floor; v.catY = p.y - c.floor
+                v.catAir = true; v.crouch = 0
+                v.catPitch = 14 * cos(.pi * u)
+            } else {                                                      // 착지
+                v.catX = c.x1; v.catFloor = c.floor; v.catY = 0
+                v.catAir = false; v.catPitch = 0; v.crouch = 0.5 * CGFloat(max(0, 1 - (l.t - Leap.crouch - fly) / Leap.land))
+            }
+        }
+        if let s = l.star {                                               // 별은 살짝 늦게 따라 굴러 날아감
+            let us = CGFloat(min(max((l.t - Leap.crouch - 0.08) / fly, 0), 1))
+            let p = arc(s, us)
+            v.starX = p.x; v.starFloor = s.floor; v.starY = p.y - s.floor
+            v.starAngle += CGFloat(dt) * 540 * (s.x1 >= s.x0 ? -1 : 1) * (us > 0 && us < 1 ? 1 : 0)
+        }
+        if v.held { v.starX = v.catX + 38 * v.catFacing; v.starFloor = v.catFloor; v.starY = v.catY }
+        leap = l.t >= Leap.crouch + fly + Leap.land + 0.08 ? nil : l
+        if leap == nil { v.crouch = 0; v.catAir = false; v.catPitch = 0; if l.star != nil { v.starY = 0 } }
+    }
 
     /// x에서 높이 y 아래로 가장 가까운 바닥(그 모니터 영역). excluding: 뚫고 떨어질 때 지금 바닥은 빼고 찾는다.
     func ground(x: CGFloat, y: CGFloat, excluding: CGFloat? = nil, cat: Bool = false, star: Bool = false) -> NSRect? {
@@ -1099,6 +1467,7 @@ final class DesktopStage {
     /// 고양이가 있는 모니터 (디스플레이 링크·메뉴 표시용)
     var screen: NSScreen? {
         NSScreen.screens.first { abs($0.visibleFrame.minY - pets.catFloor) < 0.5 && pets.catX >= $0.frame.minX && pets.catX <= $0.frame.maxX }
+            ?? NSScreen.screens.first { $0.frame.contains(NSPoint(x: pets.catX, y: pets.catFloor + 1)) }   // 앱 창 위
             ?? NSScreen.screens.first
     }
 
@@ -1138,6 +1507,8 @@ final class DesktopStage {
         }
         catWin = makeWindow(catView, Self.catSize)
         starWin = makeWindow(starView, Self.starSize)
+        bowlWin = makeWindow(bowlView, Self.bowlSize)
+        bowlView.paint = { [unowned self] in if let b = bowl { Pets.drawBowl(x: b.x, floor: b.floor, food: food, zoom: pets.zoom) } }
         catView.paint = { [unowned self] in pets.drawCat() }
         starView.paint = { [unowned self] in pets.drawStar() }
         for v in [catView, starView] {
@@ -1155,12 +1526,17 @@ final class DesktopStage {
     }
 
     var baseLevel: NSWindow.Level {
-        inFront ? .floating : NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
+        // 메뉴바 위에서 놀 때는 메뉴바보다 위로
+        if onMenuBar { return frontLevel }
+        // 앱 창 위에 서 있을 때는 다른 창에 가리지 않게 창들 위로
+        return inFront || appTop != nil ? .floating : NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
     }
+    /// 앞으로 나올 때의 층: 평소엔 창들 위, 메뉴바에서 놀 때는 메뉴바 위
+    var frontLevel: NSWindow.Level { onMenuBar ? NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1) : .floating }
 
     func applyLevel() {
         // 기본: 바탕화면 아이콘 바로 위(앱 창들 아래). 선택 시: 모든 창 위.
-        catWin.level = baseLevel; starWin.level = baseLevel
+        catWin.level = baseLevel; starWin.level = baseLevel; bowlWin.level = baseLevel
     }
 
     private func orderWindows() {
@@ -1168,7 +1544,8 @@ final class DesktopStage {
         if visible {
             catWin.orderFrontRegardless()
             starWin.order(.above, relativeTo: catWin.windowNumber)   // 별이 고양이 위에 보이게 (입에 문 모습)
-        } else { catWin.orderOut(nil); starWin.orderOut(nil) }
+            if bowl != nil { bowlWin.order(.below, relativeTo: catWin.windowNumber) }   // 밥그릇은 고양이 뒤
+        } else { catWin.orderOut(nil); starWin.orderOut(nil); bowlWin.orderOut(nil) }
     }
 
     /// 모니터를 빼거나 배열을 바꾸면, 사라진 바닥 위에 있던 개체는 남은 바닥으로 옮긴다
@@ -1191,12 +1568,263 @@ final class DesktopStage {
     }
     private var grabCursor = false
 
+    // MARK: 밥그릇 (사료 양 = 실제 배터리 잔량, 배터리가 없는 Mac이면 가득)
+    private(set) var bowl: (x: CGFloat, floor: CGFloat)?
+    private(set) var food: CGFloat = 1
+    private var bowlDrawn: CGFloat = -1, foodAt = -100.0
+    /// 고양이가 서 있는 모니터 바닥, 왼쪽에서 4분의 1쯤에 둔다 (고양이가 다른 모니터로 가면 따라감)
+    private func updateBowl() {
+        let v = pets
+        if onScreenFloor(v.catFloor) && v.catY <= 0 {
+            let r = screenRect(floor: v.catFloor, near: v.catX)
+            let b = (x: (r.minX + r.width * 0.22).rounded(), floor: r.minY)
+            if bowl == nil || bowl!.x != b.x || bowl!.floor != b.floor { bowl = b; dirty = true }
+        }
+        let now = CACurrentMediaTime()
+        if now - foodAt > 30 {
+            foodAt = now
+            if let f = Self.battery(), abs(f - food) > 0.005 { food = f; dirty = true }
+        }
+    }
+    static func battery() -> CGFloat? {
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] else { return nil }
+        for src in list {
+            guard let d = IOPSGetPowerSourceDescription(info, src)?.takeUnretainedValue() as? [String: Any],
+                  let cur = d["Current Capacity"] as? Int, let mx = d["Max Capacity"] as? Int, mx > 0 else { continue }
+            return CGFloat(cur) / CGFloat(mx)
+        }
+        return nil
+    }
+
+    // MARK: 쉬는 고양이 (Claude가 일을 안 할 때)
+    // - 사용자가 컴퓨터를 쓰는 중(최근 2분 안에 키보드·마우스 입력): 고양이도 깨어 있다.
+    //   커서 구경 · 그루밍 · 기지개 · 어슬렁 산책 · 별 툭 치고 쫓아가 물어 오기 중에서 골라 한다.
+    //   물어 온 별은 밥그릇 맞은편에 버리고, 3분마다 배가 고프면 밥을 먹으러 간다.
+    // - 사용자가 자리를 비움(2분 넘게 입력 없음): 밥그릇 앞으로 가서 잔다 (다시 그리지 않음).
+    //   사용자가 돌아오면 기지개를 켜고 일어난다.
+    private enum Act { case watch, groom, stretch, wander(CGFloat), toStar, bat }
+    private enum RestPhase { case walk, toss(Double), eat(Double), sleep, awake(Act, Double, Double) }   // 할 일, 지난 시간, 길이
+    private var rest: RestPhase?, restSide: CGFloat = 1
+    private var restClock = 0.0, ateAt = -1e9, batted = false, kickNext = false
+    private(set) var kicks = 0   // 확인용: 발로 찬 횟수
+    var userAwayOverride: Bool?, simCursor: NSPoint?    // 확인용
+    private var awayAt = -100.0, userAway = false
+    private var hungry: Bool { restClock - ateAt > 180 }
+    /// 확인용: 지금 쉬는 단계 이름
+    var debugRest: String {
+        guard let r = rest else { return play == .none ? "-" : "별 놀이" }
+        switch r {
+        case .walk: return "밥그릇으로"
+        case .toss: return "별 던지기"
+        case .eat: return "밥"
+        case .sleep: return "잠"
+        case .awake(let a, _, _):
+            switch a {
+            case .watch: return "커서 구경"
+            case .groom: return "그루밍"
+            case .stretch: return "기지개"
+            case .wander: return "산책"
+            case .toStar: return "별에게"
+            case .bat: return "툭 치기"
+            }
+        }
+    }
+    /// 사용자가 자리를 비웠는지 (마지막 키보드·마우스 입력이 2분 넘게 전). 1초마다만 확인.
+    private func isUserAway() -> Bool {
+        if let o = userAwayOverride { return o }
+        let now = CACurrentMediaTime()
+        if now - awayAt > 1 {
+            awayAt = now
+            let any = CGEventType(rawValue: ~0)!
+            userAway = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: any) > 120
+        }
+        return userAway
+    }
+    private func starFree(_ v: Pets) -> Bool {
+        !v.held && v.sameFloor && v.starY <= 0 && onScreenFloor(v.starFloor) && play == .none
+    }
+    /// 다음에 할 일 고르기
+    private func nextAct() -> RestPhase {
+        let v = pets
+        let r = screenRect(floor: v.catFloor, near: v.catX)
+        var roll = Double.random(in: 0..<1)
+        if !starFree(v) && roll >= 0.78 { roll = Double.random(in: 0..<0.78) }
+        switch roll {
+        case ..<0.3: return .awake(.watch, 0, .random(in: 3...7))
+        case ..<0.5: return .awake(.groom, 0, .random(in: 3...5))
+        case ..<0.56: return .awake(.stretch, 0, 1.6)
+        case ..<0.78:
+            let lo = r.minX + 60, hi = r.maxX - 60
+            var to = CGFloat.random(in: lo...max(lo, hi))
+            if abs(to - v.catX) < 120 { to = min(max(v.catX + (to >= v.catX ? 160 : -160), lo), hi) }
+            return .awake(.wander(to), 0, 30)
+        default: return .awake(.toStar, 0, 12)
+        }
+    }
+    /// 밥그릇에 다녀온 뒤: 배고프면 밥, 사용자가 없으면 잠, 아니면 놀기
+    private func afterBowl() -> RestPhase { hungry ? .eat(0) : isUserAway() ? .sleep : nextAct() }
+    /// 앉은 자세 (뒤를 낮추고 머리를 듦)
+    private func sit(_ v: Pets) { v.catMode = .run; v.moving = 0; v.crouch = 0.55; v.catPitch = 10; v.excite = 0.1 }
+    /// 걸어가기. 바닥에 놓인 별은 밟고 지나가지 않는다: 길에 있으면 폴짝 뛰어넘고, 별 자리가 목적지면 그 앞에서 멈춘다.
+    private func walk(_ v: Pets, to x0: CGFloat, speed: CGFloat, _ dt: Double) -> Bool {
+        let starHere = !v.held && v.sameFloor && v.starY <= 0.5 && play == .none
+        var x = x0
+        if starHere && abs(x - v.starX) < 42 { x = v.starX + (v.catX <= v.starX ? -42 : 42) }
+        let d = x - v.catX
+        guard abs(d) > 2 else { v.catX = x; v.hopY = 0; v.catAir = false; return true }
+        let step = min(abs(d), speed * CGFloat(dt)) * (d > 0 ? 1 : -1)
+        v.catX += step; v.catFacing = d > 0 ? 1 : -1; v.catPhase += abs(step) / 7
+        v.catMode = .run; v.moving = 1; v.excite = 0.4; v.crouch = 0; v.headUp = 0; v.catPitch = 0; v.pawUp = 0
+        // 길에 놓인 별: 반은 발에 치여 날아가고(고양이는 잠깐 바라보다 쫓아감), 반은 폴짝 뛰어넘음
+        let ahead = (v.starX - v.catX) * v.catFacing
+        if !starHere || ahead > 60 || ahead < -40 { kickNext = Bool.random() }
+        if starHere && kickNext && ahead > 0 && ahead < 28 {
+            play = .free; toppled = false; starTumble = false
+            sv = CGVector(dx: v.catFacing * CGFloat.random(in: 300...420), dy: CGFloat.random(in: 140...220))
+            spin = sv.dx * 1.5; chaseDelay = 0.9
+            v.hopY = 0; v.catAir = false; v.catPitch = 0; v.moving = 0
+            kicks += 1
+            return false
+        }
+        // 별 위를 지나는 동안(별 앞뒤 40px) 포물선으로 뜸
+        let u = starHere && !kickNext ? (v.catX - (v.starX - v.catFacing * 40)) * v.catFacing / 80 : -1
+        v.hopY = u > 0 && u < 1 ? sin(.pi * u) * 28 : 0
+        v.catAir = v.hopY > 0
+        v.catPitch = v.catAir ? 12 * cos(.pi * u) : 0      // 오를 땐 머리를 들고, 내려올 땐 숙임
+        dirty = true
+        return false
+    }
+
+    private func stepRest(_ b: (x: CGFloat, floor: CGFloat), cursor m: NSPoint, _ dt: Double) {
+        let v = pets
+        restClock += dt
+        if rest == nil {
+            restSide = v.catX >= b.x ? 1 : -1           // 고양이가 온 쪽에서 밥그릇을 바라봄
+            // 그쪽에 별이 놓여 있으면(밥그릇 앞자리와 겹침) 반대편에 앉는다
+            if !v.held && v.sameFloor && abs(v.starX - (b.x + restSide * 26)) < 34 { restSide = -restSide }
+            v.resetPose()
+            rest = v.held || hungry || isUserAway() ? .walk : nextAct()
+            if case .walk = rest! { v.catMode = .run }
+            dirty = true
+        }
+        switch rest! {
+        case .walk:
+            let spot = b.x + restSide * 26
+            if walk(v, to: spot, speed: 120, dt) {
+                v.catFacing = -restSide
+                rest = v.held ? .toss(0) : afterBowl()
+            }
+            if v.held {   // 입에 문 별을 들고 감
+                v.starFloor = v.catFloor; v.starX = v.catX + v.catFacing * 18; v.starY = -6; v.starAngle = 20
+            }
+            dirty = true
+        case .toss(let t0):
+            // 고개를 휙 들어 별을 밥그릇 너머(맞은편)로 던짐: 한 바퀴 돌며 포물선
+            let t = t0 + dt, u = CGFloat(min(t / 0.5, 1))
+            if t0 == 0 { v.held = false }
+            let fromX = v.catX + v.catFacing * 18, toX = b.x - restSide * 44
+            v.starFloor = v.catFloor
+            v.starX = fromX + (toX - fromX) * u
+            v.starY = -6 * (1 - u) + sin(.pi * u) * 38
+            v.starAngle = 20 * (1 - u) + 360 * u * -restSide
+            v.headUp = 30 * sin(.pi * u); v.moving = 0
+            if u >= 1 { v.starY = 0; v.starAngle = 0; v.headUp = 0; rest = afterBowl() } else { rest = .toss(t) }
+            dirty = true
+        case .eat(let t0):
+            // 밥그릇에 고개를 묻고 오물오물 (밥그릇 앞에 있지 않으면 먼저 걸어감)
+            if abs(v.catX - (b.x + restSide * 26)) > 3 { rest = .walk; return }
+            let t = t0 + dt
+            v.catMode = .run; v.catFacing = -restSide
+            v.moving = 0; v.crouch = 0.5; v.catPitch = -6; v.excite = 0.15; v.pawUp = 0
+            v.headUp = -38 + CGFloat(sin(t * 10)) * 6
+            if t > 6 { ateAt = restClock; v.resetPose(); rest = isUserAway() ? .sleep : nextAct() } else { rest = .eat(t) }
+            dirty = true
+        case .sleep:
+            if abs(v.catX - (b.x + restSide * 26)) > 3 { rest = .walk; return }
+            if v.catMode != .sleep { v.catMode = .sleep; v.catFacing = -restSide; v.resetPose(); dirty = true }
+            if !isUserAway() { v.catMode = .run; v.resetPose(); rest = .awake(.stretch, 0, 1.6); dirty = true }   // 사용자가 돌아옴 → 기지개
+        case .awake(let act, let t0, let len):
+            if isUserAway() || hungry { rest = nil; return }      // 자러 가거나 밥 먹으러 감
+            let t = t0 + dt
+            var done = t > len
+            switch act {
+            case .watch:
+                // 앉아서 커서를 구경: 커서가 움직일 때만 고개가 따라감. 꼬리는 낮게 두고 끝만 까딱
+                sit(v); v.pawUp = 0; v.tailMood = .watch
+                let face: CGFloat = m.x >= v.catX ? 1 : -1
+                let dy = m.y - (v.catFloor + v.catY + 22), dx = max(abs(m.x - v.catX), 1)
+                let look = min(max(atan2(dy, dx) * 180 / .pi - v.catPitch, -12), 50)
+                if face != v.catFacing || abs(look - v.headUp) > 0.8 { v.catFacing = face; v.headUp = look; dirty = true }
+                if t0 == 0 { dirty = true }
+            case .groom:
+                // 앞발을 들어 핥기 (꼬리는 발 앞으로 감아 둠)
+                sit(v); v.tailMood = .content
+                let up = CGFloat(min(t / 0.3, 1, max(len - t, 0) / 0.3))
+                v.pawUp = up * (0.85 + 0.15 * CGFloat(sin(t * 6)))
+                v.headUp = -22 * up + CGFloat(sin(t * 7)) * 6 * up
+                dirty = true
+            case .stretch:
+                // 앞으로 쭉 기지개 (앞은 낮추고 엉덩이는 높이)
+                let s = sin(.pi * CGFloat(min(t / len, 1)))
+                v.catMode = .run; v.moving = 0; v.pawUp = 0
+                v.catPitch = -16 * s; v.crouch = 0.3 * s; v.headUp = 14 * s; v.excite = 0.2
+                dirty = true
+            case .wander(let x):
+                done = walk(v, to: x, speed: 65, dt) || done
+                if done { v.moving = 0; dirty = true }
+            case .toStar:
+                // 별에게 걸어가서
+                guard starFree(v) else { done = true; break }
+                let side: CGFloat = v.starX >= v.catX ? 1 : -1
+                if walk(v, to: v.starX - side * 30, speed: 90, dt) {
+                    v.catFacing = side; batted = false
+                    rest = .awake(.bat, 0, 0.6); return
+                }
+            case .bat:
+                // 앞발로 툭! → 별이 굴러가면 쫓아가서 문다 (그다음은 별 놀이가 이어받음)
+                let u = CGFloat(min(t / 0.35, 1))
+                v.tailMood = .hunt
+                v.catMode = .run; v.moving = 0; v.crouch = 0.4 * (1 - u); v.headUp = -10; v.pawUp = sin(.pi * u)
+                if t >= 0.2 && !batted && starFree(v) {
+                    batted = true; chaseDelay = 0.7
+                    play = .free; toppled = false; starTumble = false
+                    sv = CGVector(dx: v.catFacing * CGFloat.random(in: 430...530), dy: CGFloat.random(in: 90...140))
+                    spin = sv.dx * 1.2
+                }
+                dirty = true
+            }
+            if done { v.resetPose(); rest = nextAct(); dirty = true }
+            else { rest = .awake(act, t, len) }
+        }
+    }
+    private var catHoverSince: Double?, hoverNow = false
+
+    /// 전역 좌표 p에서, 우리 창(mine)보다 앞에 다른 앱 창이 덮고 있는가 (고양이·별이 그 창 뒤에 가려져 보이지 않음)
+    /// 화면 목록은 앞에 있는 창부터 나오므로, 우리 창이 먼저 나오면 보이는 것.
+    static func windowCovers(_ p: NSPoint, above mine: Int) -> Bool {
+        let primaryH = NSScreen.screens.first?.frame.height ?? 0, me = getpid()
+        let q = CGPoint(x: p.x, y: primaryH - p.y)
+        for w in CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [] {
+            if (w[kCGWindowNumber as String] as? Int) == mine { return false }
+            guard (w[kCGWindowLayer as String] as? Int) == 0, (w[kCGWindowOwnerPID as String] as? pid_t) != me,
+                  (w[kCGWindowAlpha as String] as? Double ?? 1) > 0.05,
+                  let b = w[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
+            if CGRect(x: b["X"] ?? 0, y: b["Y"] ?? 0, width: b["Width"] ?? 0, height: b["Height"] ?? 0).contains(q) { return true }
+        }
+        return false
+    }
+
     // MARK: 잡기 (전역 좌표)
+
+    /// 별을 누른 곳·때와 그 뒤 커서가 움직인 가장 먼 거리 (살짝 눌렀다 떼면 Claude 앱을 연다)
+    private var starPress: (at: NSPoint, t: Double, moved: CGFloat)?
 
     func mouseDown(_ p: NSPoint) {
         let v = pets
         v.dragLock = false
-        if v.onStar(p) { v.dragging = true; v.held = false }
+        starPress = nil
+        if v.onStar(p) { v.dragging = true; v.held = false; starPress = (p, CACurrentMediaTime(), 0) }
         else if v.onCat(p) { v.draggingCat = true; v.grabPoint = p }
         else { return }
         NSCursor.closedHand.set()
@@ -1205,6 +1833,7 @@ final class DesktopStage {
 
     func mouseDragged(_ p: NSPoint) {
         let v = pets
+        if let s = starPress { starPress?.moved = max(s.moved, hypot(p.x - s.at.x, p.y - s.at.y)) }
         if v.dragging {
             // 커서 아래 바닥 위로 (Dock 위에서 끌면 그 모니터 바닥에 붙음)
             let floor = ground(x: p.x, y: p.y - 11)?.minY
@@ -1222,6 +1851,63 @@ final class DesktopStage {
         if v.dragLock { v.dragLock = false; return }
         v.dragging = false; v.draggingCat = false   // 놓으면 물리로 떨어진다
         NSCursor.openHand.set()
+        // 별을 끌지 않고 살짝 눌렀다 떼면(5px·0.4초 안):
+        //  바탕화면의 별 → Claude를 켜서 맨 앞으로 + "창 위에 보이기" 켬
+        //  창 위에 떠 있는 별 → Claude 창을 숨기고 별은 다시 바탕화면으로
+        if let s = starPress, s.moved < 5, CACurrentMediaTime() - s.t < 0.4 { starClicked() }
+        starPress = nil
+    }
+
+    static let claudeID = "com.anthropic.claudefordesktop"
+    private func starClicked() {
+        let ws = NSWorkspace.shared
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: Self.claudeID).first
+        if inFront, let running {
+            // 창 숨기기: 노란 버튼(최소화)과 같은 효과로 Dock에 빨려 들어가게. 권한이 없으면 그냥 숨긴다.
+            if !Self.setMinimized(true, pid: running.processIdentifier) { running.hide() }
+            inFront = false
+            return
+        }
+        inFront = true
+        guard let url = running?.bundleURL ?? ws.urlForApplication(withBundleIdentifier: Self.claudeID) else { return }
+        if let running {
+            // 켜져 있으면: Dock에서 창이 다시 튀어나오는 효과로 되살리고 맨 앞으로
+            running.unhide()
+            _ = Self.setMinimized(false, pid: running.processIdentifier)
+        }
+        // 맨 앞으로: 우리 창은 앞으로 나오지 않는 창이라 직접 활성화를 부탁할 수 없으므로,
+        // 열기 설정의 activates(맨 앞으로)로 열고, 창이 뜨면 한 번 더 앞으로 가져온다.
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.activates = true
+        ws.openApplication(at: url, configuration: cfg) { app, _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                app?.activate(options: [.activateAllWindows])
+                if app?.isActive == false { ws.openApplication(at: url, configuration: cfg) }   // 아직 뒤에 있으면 다시
+            }
+        }
+    }
+
+    /// 그 앱의 창들을 최소화(true)하거나 되살린다(false). Dock 설정의 효과(지니·크기 조절)가 그대로 쓰인다.
+    /// "손쉬운 사용" 권한이 필요하다. 하나라도 바꿨으면 true.
+    @discardableResult
+    static func setMinimized(_ on: Bool, pid: pid_t) -> Bool {
+        guard AXIsProcessTrusted() else { return false }
+        let app = AXUIElementCreateApplication(pid)
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &v) == .success,
+              let wins = v as? [AXUIElement], !wins.isEmpty else { return false }
+        var done = false
+        for w in wins {
+            var role: CFTypeRef?, sub: CFTypeRef?, cur: CFTypeRef?
+            AXUIElementCopyAttributeValue(w, kAXRoleAttribute as CFString, &role)
+            AXUIElementCopyAttributeValue(w, kAXSubroleAttribute as CFString, &sub)
+            guard role as? String == kAXWindowRole, sub as? String == kAXStandardWindowSubrole else { continue }   // 일반 창만
+            AXUIElementCopyAttributeValue(w, kAXMinimizedAttribute as CFString, &cur)
+            if (cur as? Bool) == on { done = true; continue }
+            if AXUIElementSetAttributeValue(w, kAXMinimizedAttribute as CFString, on as CFBoolean) == .success { done = true }
+            if !on { AXUIElementPerformAction(w, kAXRaiseAction as CFString) }
+        }
+        return done
     }
 
     var simulate = false   // 확인용 그림 저장 중에는 창·마우스를 쓰지 않음
@@ -1235,21 +1921,50 @@ final class DesktopStage {
         // 물었을 때 별 크기가 툭 바뀌지 않게 천천히
         let scaleTarget: CGFloat = v.held ? 0.7 : 1
         if abs(v.starScale - scaleTarget) > 0.002 { v.starScale += (scaleTarget - v.starScale) * min(1, 8 * CGFloat(dt)); dirty = true }
+        // 창을 따라 메뉴바 안까지 올라가면 남은 높이에 맞춰 살짝 작아진다 (내려가면 다시 커짐)
+        let zoomTarget = menuZoom
+        if abs(v.zoom - zoomTarget) > 0.002 { v.zoom += (zoomTarget - v.zoom) * min(1, 6 * CGFloat(dt)); dirty = true } else { v.zoom = zoomTarget }
         if busy && !lastBusy { v.held = false }   // Claude가 새로 바빠지면 별을 놓고 다시 쫓기 시작
         lastBusy = busy
-        defer { noteScreen(); flush() }
+        v.tailMood = .auto                                   // 쉬기 단계가 이번 프레임에 다시 정함
+        defer {
+            if chaseDelay > 0 { v.tailMood = .hunt }         // 툭 친 별을 노려보는 동안: 꼬리를 휙휙
+            if !hoverNow, v.updateTail(dt) { dirty = true }   // 마우스가 닿아 멈춘 동안은 꼬리도 멈춤
+            noteScreen(); flush()
+        }
         if !simulate { checkCommand() }
+        trackAppWindow()
         if trip != nil { setGrabbable(cat: false, star: false); stepTrip(dt); dirty = true; return }
+        if leap != nil { setGrabbable(cat: false, star: false); stepLeap(dt); dirty = true; return }
 
         // 마우스가 고양이나 별에 닿으면 그 자리에서 멈춘다. 닿은 개체는 손 모양으로 잡을 수 있다.
         let m = NSEvent.mouseLocation
-        let overStar = !simulate && v.onStar(m), overCat = !simulate && v.onCat(m) && !overStar
+        // 앱 창이 그 자리를 덮고 있으면(고양이·별이 창 뒤에 있음) 잡지 않고 클릭을 창에 그대로 넘긴다
+        let rawStar = !simulate && v.onStar(m), rawCat = !simulate && v.onCat(m) && !rawStar
+        let covered = (rawStar || rawCat) && !v.dragging && !v.draggingCat
+            && Self.windowCovers(m, above: (rawStar ? starWin : catWin).windowNumber)
+        let overStar = rawStar && !covered
+        // 고양이는 커서를 잠깐(0.35초) 올려 두었을 때만 잡을 수 있음: 지나가다 누른 클릭은 아래로 통과
+        if rawCat && !covered { if catHoverSince == nil { catHoverSince = CACurrentMediaTime() } } else { catHoverSince = nil }
+        let overCat = rawCat && !covered && (v.draggingCat || CACurrentMediaTime() - (catHoverSince ?? .infinity) > 0.35)
+        hoverNow = (overCat || overStar) && !v.dragging && !v.draggingCat && v.catMode == .run
         setGrabbable(cat: (overCat || v.draggingCat) && !v.hanging && !v.dragging && play != .carry,
                      star: (overStar || v.dragging) && !v.hanging && !v.draggingCat)
         // 헛디뎌 떨어지는 상태 풀기: 잡았거나, 물고 있거나, 모니터 바닥에 멈췄으면 (계속 남으면 이후 모든 발판을 무시하게 됨)
         if v.dragging || v.held || (v.starY <= 0.5 && sv.dy == 0 && onScreenFloor(v.starFloor)) { starTumble = false }
         if v.draggingCat || (v.catY <= 0 && onScreenFloor(v.catFloor)) { catTumble = false }
         perchTick()
+        // 쉬는 중(Claude가 일을 안 함): 문 별은 밥그릇 맞은편에 버리고, 밥을 먹다가 그 앞에서 잔다
+        updateBowl()
+        // (방금 놓은 별·고양이는 먼저 물리로 떨어져야 하므로 쉬기에서 뺀다)
+        if !busy, play == .none, !v.dragging, !v.draggingCat, !v.hanging, !wasDragging, !wasCatDrag, !dropping, dropFrom == nil,
+           jump == nil, v.catY <= 0,
+           let b = bowl, abs(b.floor - v.catFloor) < 1 {
+            if !((overCat || overStar) && v.catMode == .run) { stepRest(b, cursor: simulate ? (simCursor ?? m) : m, dt) }   // 마우스가 닿으면 그 자리에서 멈춤
+            return
+        } else if rest != nil {
+            rest = nil; if v.catMode == .run { v.resetPose() }
+        }
         // 발판 위(앱 요소 위)에 있으면 화면 바닥 전용인 평소 쫓기 대신 놀이 단계로
         let onLedges = !v.held && (!onScreenFloor(v.catFloor) || !onScreenFloor(v.starFloor))
         if v.dragging || wasDragging || v.draggingCat || wasCatDrag || v.catY > 0 || dropping || dropFrom != nil || play != .none || onLedges
@@ -1364,6 +2079,7 @@ final class DesktopStage {
     private var sv = CGVector.zero, spin: CGFloat = 0     // 별 속도(px/s), 회전 속도(도/s)
     private var catVy: CGFloat = 0, jumpWait = 0.0, hangT = 0.0
     let gravity: CGFloat = 1500, starGravity: CGFloat = 2400, maxJump: CGFloat = 90, catchRadius: CGFloat = 16
+    private var chaseDelay = 0.0
     private var crouchT = 0.0, pendingVy: CGFloat = 0, landT = 0.0
     private var catVx: CGFloat = 0, pendingVx: CGFloat = 0
     let maxJumpX: CGFloat = 340, maxLaunchVx: CGFloat = 620     // 한 번에 옆으로 뛸 수 있는 거리, 낼 수 있는 가로 속도
@@ -1886,7 +2602,8 @@ final class DesktopStage {
         var moved: CGFloat = 0
         let grounded = v.catY <= 0 && catVy == 0 && !dropping && dropFrom == nil
 
-        if chasing && crouchT <= 0 {
+        if chaseDelay > 0 { chaseDelay -= dt }                // 앞발로 툭 친 직후: 굴러가는 별을 잠깐 바라봄
+        if chasing && crouchT <= 0 && chaseDelay <= 0 {
             // 어디로 갈지: 같은 바닥이면 입이 별 밑에 오도록. 다르면 그 높이로 건너갈 착지점을 정해 포물선으로 뛴다.
             var targetX = v.starX - (dxs >= 0 ? 1 : -1) * 22        // 별이 있는 쪽에서 다가가 입이 별 밑에 오도록
             var jumpTo: NSPoint?                                  // 포물선으로 뛸 착지점 (x, 바닥 높이)
@@ -2043,7 +2760,7 @@ final class DesktopStage {
             if v.catY <= 0 { holdNow() }
             return
         }
-        guard play != .reunite, chasing, hypot(mouth.x - v.starX, mouth.y - v.starCenter.y) < catchRadius else { return }
+        guard play != .reunite, chasing, chaseDelay <= 0, hypot(mouth.x - v.starX, mouth.y - v.starCenter.y) < catchRadius else { return }
         if v.dragging {
             // 매달림: 그랩 자동 해제
             v.dragging = false; v.dragLock = true; wasDragging = false
@@ -2153,15 +2870,20 @@ final class DesktopStage {
     // MARK: 그리기
 
     private(set) var lastDraw = 0.0
+    /// 고양이 모양을 바꿨을 때 바로 다시 그림
+    func redrawCat() { dirty = true; catView.needsDisplay = true }
     private func flush() {
         guard dirty else { return }   // 바뀐 게 없으면 다시 그리지 않음
         dirty = false; lastDraw = CACurrentMediaTime()
         guard !simulate else { return }
         // 앱 창 안의 글자를 타고 오르거나, 공중에 있거나, 잡혀 있을 땐 앱 창들 앞으로. 평소엔 바탕화면 바로 위.
         let p = pets
-        let catFront = climbing || p.catY > 0 || dropFrom != nil || catGrabbable || p.draggingCat || p.hanging
-        let starFront = starGrabbable || p.dragging || p.starY > 0 || p.hanging || (p.held && catFront)
-        let cl: NSWindow.Level = catFront ? .floating : baseLevel, sl: NSWindow.Level = starFront || catFront && p.held ? .floating : baseLevel
+        // 앱 창 속 글자·버튼 위에 올라가 있으면(모니터 바닥이 아님) 그 창 뒤로 숨지 않게 앞으로
+        let catPerched = !onScreenFloor(p.catFloor) && !p.dangling
+        let starPerched = !onScreenFloor(p.starFloor) && !p.held
+        let catFront = climbing || p.catY > 0 || dropFrom != nil || catGrabbable || p.draggingCat || p.hanging || catPerched
+        let starFront = starGrabbable || p.dragging || p.starY > 0 || p.hanging || (p.held && catFront) || starPerched
+        let cl: NSWindow.Level = catFront ? frontLevel : baseLevel, sl: NSWindow.Level = starFront || catFront && p.held ? frontLevel : baseLevel
         if catWin.level != cl { catWin.level = cl }
         if starWin.level != sl { starWin.level = sl; starWin.order(.above, relativeTo: catWin.windowNumber) }
         // 각 창을 개체 위치로 옮기고 다시 그린다 (창은 작아서 매 프레임 그려도 싸다)
@@ -2169,6 +2891,15 @@ final class DesktopStage {
         catWin.setFrameOrigin(NSPoint(x: (c.midX - cs.width / 2).rounded(), y: (c.midY - cs.height / 2).rounded()))
         starWin.setFrameOrigin(NSPoint(x: (s.midX - ss.width / 2).rounded(), y: (s.midY - ss.height / 2).rounded()))
         catView.needsDisplay = true; starView.needsDisplay = true
+        if let b = bowl {
+            if bowlWin.level != baseLevel { bowlWin.level = baseLevel }
+            let o = NSPoint(x: (b.x - Self.bowlSize.width / 2).rounded(), y: (b.floor - 4).rounded())
+            if bowlWin.frame.origin != o || !bowlWin.isVisible {
+                bowlWin.setFrameOrigin(o)
+                if visible { bowlWin.order(.below, relativeTo: catWin.windowNumber) }
+            }
+            if bowlDrawn != food * 10 + p.zoom { bowlDrawn = food * 10 + p.zoom; bowlView.needsDisplay = true }
+        }
     }
 }
 
@@ -2186,6 +2917,7 @@ final class SceneView: NSView {
         }
         NSColor.systemBlue.setStroke()
         for l in stage.simLedges ?? [] { let p = NSBezierPath(); p.lineWidth = 2; p.move(to: NSPoint(x: l.minX, y: l.minY)); p.line(to: NSPoint(x: l.maxX, y: l.minY)); p.stroke() }
+        if let b = stage.bowl { Pets.drawBowl(x: b.x, floor: b.floor, food: stage.food) }
         stage.pets.drawCat(); stage.pets.drawStar()
     }
 }
@@ -2326,6 +3058,151 @@ func exportStage(to path: String, multi: Bool) {
     }
     NSGraphicsContext.restoreGraphicsState()
     try? out.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+}
+
+/// 확인용: 쉬는 중에 별을 잡아 던지면 떨어지는가. 사용법: --throw-test
+if CommandLine.arguments.contains("--throw-test") {
+    _ = NSApplication.shared
+    let stage = DesktopStage()
+    stage.simulate = true; stage.catWin.orderOut(nil); stage.starWin.orderOut(nil); stage.bowlWin.orderOut(nil)
+    let v = stage.pets
+    stage.simScreens = [NSRect(x: 0, y: 0, width: 900, height: 300)]
+    stage.place(on: stage.simScreens![0])
+    stage.userAwayOverride = false
+    v.catX = 500; v.starX = 620; v.starFloor = v.catFloor
+    for _ in 0..<(24 * 12) { stage.update(busy: false, cpu: 0, dt: 1 / 24) }      // 쉬는 중으로
+    print("쉬는 단계:", stage.debugRest)
+    v.dragging = true; v.held = false
+    for k in 0..<12 { stage.mouseDragged(NSPoint(x: 620 + CGFloat(k) * 12, y: 60 + CGFloat(k) * 10)); stage.update(busy: false, cpu: 0, dt: 1 / 24) }
+    stage.update(busy: false, cpu: 0, dt: 1 / 24); stage.mouseUp()
+    for k in 1...48 {
+        stage.update(busy: false, cpu: 0, dt: 1 / 24)
+        if k % 8 == 0 { print(String(format: "놓고 %.2f초: 별 x%.0f 높이%.0f  고양이 x%.0f  %@", Double(k) / 24, v.starX, v.starY, v.catX, stage.debugRest)) }
+    }
+    exit(0)
+}
+
+/// 확인용: 고양이 모양 3가지 × 자세. 사용법: --looks 파일.png
+if let i = CommandLine.arguments.firstIndex(of: "--looks"), i + 1 < CommandLine.arguments.count {
+    _ = NSApplication.shared
+    let p = Pets(), cell = NSSize(width: 110, height: 80), scale: CGFloat = 3
+    let poses: [(String, (Pets) -> Void)] = [
+        ("걷기", { $0.catMode = .run; $0.resetPose(); $0.catPhase = 1.2 }),
+        ("쫓기", { $0.catMode = .run; $0.resetPose(); $0.catPhase = 2.2; $0.excite = 1 }),
+        ("앉아 구경", { $0.catMode = .run; $0.resetPose(); $0.moving = 0; $0.crouch = 0.55; $0.catPitch = 10; $0.headUp = 30; $0.tailMood = .watch }),
+        ("그루밍", { $0.catMode = .run; $0.resetPose(); $0.moving = 0; $0.crouch = 0.55; $0.catPitch = 10; $0.pawUp = 0.9; $0.headUp = -22; $0.tailMood = .content }),
+        ("노려보기", { $0.catMode = .run; $0.resetPose(); $0.moving = 0; $0.crouch = 0.4; $0.headUp = -10; $0.tailMood = .hunt }),
+        ("밥", { $0.catMode = .run; $0.resetPose(); $0.moving = 0; $0.crouch = 0.5; $0.catPitch = -6; $0.headUp = -38 }),
+        ("점프", { $0.catMode = .run; $0.resetPose(); $0.catAir = true; $0.catPitch = 10 }),
+        ("잠", { $0.catMode = .sleep; $0.resetPose() }),
+    ]
+    let looks: [(String, Pets.Look)] = [("검은 고양이", .black), ("랙돌", .ragdoll), ("페르시안", .persian)]
+    let W = Int(cell.width * scale) * poses.count, H = Int(cell.height * scale + 18) * looks.count
+    let out = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: H, bitsPerSample: 8, samplesPerPixel: 4,
+                               hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+    NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: out)
+    for (r, (lname, lk)) in looks.enumerated() {
+        let saved = Pets.look; Pets.look = lk
+        for (c, (pname, pose)) in poses.enumerated() {
+            let ox = CGFloat(c) * cell.width * scale, oy = CGFloat(looks.count - 1 - r) * (cell.height * scale + 18)
+            // 왼쪽 반은 밝은 배경, 오른쪽 반은 어두운 배경 (바탕화면이 어떤 색이든 보이는지)
+            NSColor(white: 0.93, alpha: 1).setFill(); NSRect(x: ox, y: oy, width: cell.width * scale / 2, height: cell.height * scale + 18).fill()
+            NSColor(white: 0.18, alpha: 1).setFill(); NSRect(x: ox + cell.width * scale / 2, y: oy, width: cell.width * scale / 2, height: cell.height * scale + 18).fill()
+            for (k, x) in [CGFloat(28), 83].enumerated() {
+                NSGraphicsContext.saveGraphicsState()
+                let tr = NSAffineTransform(); tr.translateX(by: ox, yBy: oy + 6); tr.scale(by: scale); tr.concat()
+                p.tailMood = .auto; pose(p); p.catX = x; p.catFloor = 6; p.catY = 0; p.catFacing = k == 0 ? 1 : -1; p.tailT = 0.4
+                for _ in 0..<(48 + k * 5) { _ = p.updateTail(1 / 24) }     // 꼬리가 자세에 맞게 자리 잡을 때까지
+                p.drawCat()
+                NSGraphicsContext.restoreGraphicsState()
+            }
+            ("\(lname) · \(pname)" as NSString).draw(at: NSPoint(x: ox + 6, y: oy + cell.height * scale), withAttributes: [.font: NSFont.boldSystemFont(ofSize: 13), .foregroundColor: NSColor.systemPink])
+        }
+        Pets.look = saved
+    }
+    NSGraphicsContext.restoreGraphicsState()
+    try? out.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
+    exit(0)
+}
+
+/// 확인용: 깨어 있는 쉬는 고양이 (사용자가 컴퓨터를 쓰는 중 → 여러 놀이, 자리 비움 → 잠). 사용법: --awake-frames 파일.png
+if let i = CommandLine.arguments.firstIndex(of: "--awake-frames"), i + 1 < CommandLine.arguments.count {
+    _ = NSApplication.shared
+    let stage = DesktopStage()
+    stage.simulate = true; stage.catWin.orderOut(nil); stage.starWin.orderOut(nil); stage.bowlWin.orderOut(nil)
+    let v = stage.pets
+    stage.simScreens = [NSRect(x: 0, y: 0, width: 900, height: 140)]
+    stage.place(on: stage.simScreens![0])
+    let scene = SceneView(stage: stage, frame: NSRect(x: 0, y: -4, width: 900, height: 144))
+    var shots: [(String, NSBitmapImageRep)] = []
+    func shot(_ n: String) { if let r = scene.bitmapImageRepForCachingDisplay(in: scene.bounds) { scene.cacheDisplay(in: scene.bounds, to: r); shots.append((n, r)) } }
+    v.catX = 500; v.catFacing = -1; v.catMode = .sleep; v.held = false
+    v.starX = 620; v.starY = 0; v.starAngle = 0; v.starFloor = v.catFloor
+    stage.userAwayOverride = false
+    var t = 0.0, last = "", pend = -1, hopShot = false, kicked = 0, kickPend = -1
+    for k in 1...(24 * 300) {
+        if t > 285 { stage.userAwayOverride = true }
+        stage.simCursor = NSPoint(x: 450 + 300 * sin(t * 0.7), y: 120)
+        stage.update(busy: false, cpu: 0, dt: 1 / 24); t += 1 / 24
+        let d = stage.debugRest
+        if d != last { last = d; pend = k + 30; print(String(format: "%.1f %@  고양이 x%.0f %@ | 별 x%.0f 높이%.0f 물기%@", t, d, v.catX, "\(v.catMode)", v.starX, v.starY, v.held ? "o" : "x")) }
+        if k == pend { shot(String(format: "%.1f초 %@", t, d)) }
+        if !v.held && v.starY <= 0.5 && abs(v.catX - v.starX) < 22 && v.hopY == 0 && d != "별 놀이" && d != "-" && d != "툭 치기" {
+            print(String(format: "  ⚠︎ 겹침 %.2f %@ 고양이 x%.0f 별 x%.0f", t, d, v.catX, v.starX))
+        }
+        if stage.kicks != kicked { kicked = stage.kicks; print(String(format: "  ⚽ 발로 참 %.2f 고양이 x%.0f 별 x%.0f", t, v.catX, v.starX)); kickPend = k + 6 }
+        if k == kickPend { shot(String(format: "%.1f초 발에 치여 날아감", t)) }
+        if v.hopY > 25 && !hopShot { hopShot = true; shot(String(format: "%.1f초 별 뛰어넘기", t)) }
+        if v.hopY > 20 && k % 3 == 0 { print(String(format: "  ↑ 뛰어넘기 %.2f 고양이 x%.0f 높이%.0f 별 x%.0f", t, v.catX, v.hopY, v.starX)) }
+    }
+    let w = Int(scene.bounds.width), h = Int(scene.bounds.height) + 16, cols = 2, rows = (shots.count + 1) / 2
+    let out = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w * cols, pixelsHigh: h * rows, bitsPerSample: 8, samplesPerPixel: 4,
+                               hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+    NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: out)
+    NSColor(white: 0.2, alpha: 1).setFill(); NSRect(x: 0, y: 0, width: w * cols, height: h * rows).fill()
+    for (j, s) in shots.enumerated() {
+        let x = CGFloat((j % cols) * w), y = CGFloat(h * (rows - 1 - j / cols))
+        s.1.draw(in: NSRect(x: x, y: y, width: CGFloat(w), height: CGFloat(h - 16)))
+        (s.0 as NSString).draw(at: NSPoint(x: x + 4, y: y + CGFloat(h - 15)), withAttributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.white])
+    }
+    NSGraphicsContext.restoreGraphicsState()
+    try? out.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
+    exit(0)
+}
+
+/// 확인용: 쉬는 고양이 (별을 문 채 밥그릇으로 → 맞은편에 버림 → 밥 → 잠). 사용법: --bowl-frames 파일.png
+if let i = CommandLine.arguments.firstIndex(of: "--bowl-frames"), i + 1 < CommandLine.arguments.count {
+    _ = NSApplication.shared
+    let stage = DesktopStage()
+    stage.simulate = true; stage.catWin.orderOut(nil); stage.starWin.orderOut(nil); stage.bowlWin.orderOut(nil)
+    let v = stage.pets
+    stage.simScreens = [NSRect(x: 0, y: 0, width: 900, height: 120)]
+    stage.place(on: stage.simScreens![0])
+    let scene = SceneView(stage: stage, frame: NSRect(x: 0, y: -4, width: 900, height: 124))
+    var shots: [(String, NSBitmapImageRep)] = []
+    func shot(_ n: String) { if let r = scene.bitmapImageRepForCachingDisplay(in: scene.bounds) { scene.cacheDisplay(in: scene.bounds, to: r); shots.append((n, r)) } }
+    // 별을 입에 문 고양이가 오른쪽에 있음
+    v.catX = 700; v.catFacing = -1; v.held = true; v.catMode = .sleep
+    v.starX = 682; v.starY = -6; v.starAngle = 20
+    var t = 0.0
+    for k in 1...(24 * 13) {
+        stage.update(busy: false, cpu: 0, dt: 1 / 24); t += 1 / 24
+        if k % 18 == 0 { shot(String(format: "%.2f초", t)) }
+        if k % 12 == 0 { print(String(format: "%.1f 고양이 x%.0f %@ 보는쪽%.0f 고개%.0f | 별 x%.0f 높이%.0f 물기%@", t, v.catX, "\(v.catMode)", v.catFacing, v.headUp, v.starX, v.starY, v.held ? "o" : "x")) }
+    }
+    let w = Int(scene.bounds.width), h = Int(scene.bounds.height) + 16, cols = 2, rows = (shots.count + 1) / 2
+    let out = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w * cols, pixelsHigh: h * rows, bitsPerSample: 8, samplesPerPixel: 4,
+                               hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+    NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: out)
+    NSColor(white: 0.2, alpha: 1).setFill(); NSRect(x: 0, y: 0, width: w * cols, height: h * rows).fill()
+    for (j, s) in shots.enumerated() {
+        let x = CGFloat((j % cols) * w), y = CGFloat(h * (rows - 1 - j / cols))
+        s.1.draw(in: NSRect(x: x, y: y, width: CGFloat(w), height: CGFloat(h - 16)))
+        (s.0 as NSString).draw(at: NSPoint(x: x + 4, y: y + CGFloat(h - 15)), withAttributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.white])
+    }
+    NSGraphicsContext.restoreGraphicsState()
+    try? out.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
+    exit(0)
 }
 
 for flag in ["--stage-frames", "--multi-frames"] {

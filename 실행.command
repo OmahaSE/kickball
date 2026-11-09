@@ -26,7 +26,10 @@ if [ ! -x "$BIN" ] || [ ClaudeThinking.swift -nt "$BIN" ]; then
   <key>NSScreenCaptureUsageDescription</key><string>고양이가 딛고 설 발판(글자 줄·버튼 윗변)을 화면에서 찾는 데 써요. 화면은 기기 밖으로 나가지 않아요.</string>
 </dict></plist>
 PLIST
-  codesign --force --sign - "$APP" 2>/dev/null   # 임시 서명: 권한 창이 앱 이름으로 뜨게
+  # 임시 서명. 기본 임시 서명은 빌드할 때마다 "다른 앱"으로 보여서 허락한 권한(손쉬운 사용·화면 기록)이 풀린다.
+  # 앱 이름표(identifier)로만 확인하게 해서, 다시 빌드해도 한 번 허락한 권한이 유지되게 한다.
+  codesign --force --sign - --identifier service.ggear.ClaudeThinking \
+    -r='designated => identifier "service.ggear.ClaudeThinking"' "$APP" 2>/dev/null
 fi
 open "$APP"
 echo "완료! 메뉴바 별 아이콘을 확인하세요. ClaudeThinking.app은 응용 프로그램 폴더로 옮겨도 돼요. 이 창은 닫아도 돼요."
